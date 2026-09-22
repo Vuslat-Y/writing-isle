@@ -1217,6 +1217,25 @@
         currentDoc.title = titleInput.value;
         currentDoc.body = editorEl.innerHTML;
         localStorage.setItem('isle_writing_current', JSON.stringify(currentDoc));
+        // 编辑对象的归属跟着正文一起存，否则重开页面后这份正文就"无主"了
+        saveEditContext();
+      }
+
+      // 记下"正在编的是哪一篇"（草稿 / 文集文章），关页面重开还能接着编
+      function saveEditContext() {
+        if (!editMode) {
+          clearSavedEditContext();
+          return;
+        }
+        const payload = { editMode };
+        if (editMode.type === 'collection' && collectionContext && collectionContext.collectionId === editMode.collectionId) {
+          payload.currentIndex = collectionContext.currentIndex;
+        }
+        localStorage.setItem('isle_edit_context', JSON.stringify(payload));
+      }
+
+      function clearSavedEditContext() {
+        localStorage.removeItem('isle_edit_context');
       }
 
       function saveDraftsToStorage() {
@@ -1250,6 +1269,7 @@
         editMode = null;
         collectionContext = null;
         hideCollectionContext();
+        clearSavedEditContext();
       }
 
       function hideCollectionContext() {
@@ -1267,6 +1287,33 @@
           }
         } else {
           hideCollectionContext();
+        }
+      }
+
+      // 重开页面时接回上次的编辑对象；它已被删掉就退回自由编辑，不留悬空状态
+      function restoreEditContext() {
+        let payload = null;
+        try {
+          const saved = localStorage.getItem('isle_edit_context');
+          payload = saved ? JSON.parse(saved) : null;
+        } catch (e) { payload = null; }
+        if (!payload || !payload.editMode) return;
+
+        if (payload.editMode.type === 'draft') {
+          if (!drafts.some(d => d.id === payload.editMode.draftId)) return;
+          editMode = { type: 'draft', draftId: payload.editMode.draftId };
+          return;
+        }
+
+        if (payload.editMode.type === 'collection') {
+          const coll = collections.find(c => c.id === payload.editMode.collectionId);
+          if (!coll || !coll.items[payload.editMode.itemIndex]) return;
+          editMode = { type: 'collection', collectionId: coll.id, itemIndex: payload.editMode.itemIndex };
+          const idx = (typeof payload.currentIndex === 'number' && coll.items[payload.currentIndex])
+            ? payload.currentIndex
+            : payload.editMode.itemIndex;
+          collectionContext = { collectionId: coll.id, items: [...coll.items], currentIndex: idx };
+          updateCollectionContextUI();
         }
       }
 
@@ -1546,39 +1593,27 @@
           card.querySelector('[data-action="deleteArticle"]')?.addEventListener('click', (e) => {
             e.stopPropagation();
             if (confirm('确定删除这篇文章吗？')) {
-              const deletedIndex = idx;
-              collData.items.splice(deletedIndex, 1);
+              // 删之前先记住"编辑器里正在编哪一篇"的对象本身。
+              // 不能靠 editMode.itemIndex 推算：删除前面一篇后，同一个 index 已经指向另一篇了。
+              const editedItem = (editMode?.type === 'collection' && editMode.collectionId === collData.id && collectionContext)
+                ? collectionContext.items[editMode.itemIndex]
+                : null;
+
+              collData.items.splice(idx, 1);
               saveCollectionsToStorage();
 
-              // 调整 editMode
-              if (editMode?.type === 'collection' && editMode.collectionId === collData.id) {
-                if (editMode.itemIndex === deletedIndex) {
-                  // 删除的正是当前编辑的文章
+              // 按对象重新认位置（被删的就是它自己时 indexOf 返回 -1 → 编辑器清空）
+              if (editedItem) {
+                const newIdx = collData.items.indexOf(editedItem);
+                if (newIdx === -1) {
                   resetEditMode();
                   setEditorContent('', '');
                   saveCurrentDocToStorage();
-                } else if (editMode.itemIndex > deletedIndex) {
-                  // 删除的文章在当前文章之前，索引减一
-                  editMode.itemIndex--;
+                } else {
+                  editMode.itemIndex = newIdx;
+                  collectionContext.items = [...collData.items];
+                  collectionContext.currentIndex = newIdx;
                 }
-              }
-
-              // 调整 collectionContext
-              if (collectionContext?.collectionId === collData.id) {
-                if (collectionContext.currentIndex === deletedIndex) {
-                  collectionContext = null;
-                  hideCollectionContext();
-                } else if (collectionContext.currentIndex > deletedIndex) {
-                  collectionContext.currentIndex--;
-                }
-                if (collectionContext && collectionContext.currentIndex >= collData.items.length) {
-                  collectionContext.currentIndex = Math.max(0, collData.items.length - 1);
-                }
-                if (collData.items.length === 0) {
-                  collectionContext = null;
-                  hideCollectionContext();
-                }
-                collectionContext.items = [...collData.items];
               }
 
               showCollectionDetail(collData.id);
@@ -1673,9 +1708,25 @@
         saveCurrentDocToStorage();
       });
 
-      // 存入草稿
+      // 存入草稿（已在编辑某份草稿时就更新那一份，不再新建）
       document.getElementById('saveToDraftBtn').addEventListener('click', () => {
         const { title, body } = getEditorContent();
+
+        // 已经是空内容，空存一份没意义
+        if ((body === '' || body === '<br>') && title === '未命名') return;
+
+        if (editMode?.type === 'draft') {
+          const draft = drafts.find(d => d.id === editMode.draftId);
+          if (draft) {
+            draft.title = title;
+            draft.content = body;
+            saveDraftsToStorage();
+            renderDrafts();
+            saveCurrentDocToStorage();
+            return;
+          }
+        }
+
         const newId = 'draft_' + Date.now();
         drafts.push({
           id: newId,
@@ -1684,7 +1735,7 @@
         });
         saveDraftsToStorage();
         renderDrafts();
-        // 切换到草稿编辑模式
+        // 切换到草稿编辑模式，后续再点「存入草稿」就是更新这一份
         editMode = { type: 'draft', draftId: newId };
         saveCurrentDocToStorage();
       });
@@ -1950,6 +2001,7 @@
 
       // 初始化
       loadFromStorage();
+      restoreEditContext();
       updateWordCount();
       editorEl.style.fontSize = '16px';
       editorEl.style.lineHeight = '2';
@@ -1957,7 +2009,8 @@
       lineHeightSlider.value = 2.0;
       renderDrafts();
       renderCollections();
-      resetEditMode();
+      // 没接回上次的编辑对象时才重置（否则会把刚恢复的归属清掉）
+      if (!editMode) resetEditMode();
     })();
   </script>
 
